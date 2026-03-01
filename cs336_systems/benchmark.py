@@ -178,6 +178,15 @@ if __name__ == "__main__":
             # 增加 mode 参数的传递，否则默认是 "forward_backward" 会走 else 分支
             res = benchmark_model(
                 size, ctx_len, mode=MODE['forward'], warmup_steps=5, precision=PRECISION['bf16'])
+            # res = benchmark_model(
+            #     size, ctx_len, mode=MODE['backward'], warmup_steps=5)
+            # res = benchmark_model(
+            #     size, ctx_len, mode=MODE['backward'], warmup_steps=0)
+            # res = benchmark_model(
+            #     size, ctx_len, mode=MODE['backward'], warmup_steps=1)
+            # res = benchmark_model(
+            #     size, ctx_len, mode=MODE['backward'], warmup_steps=2)
+
             results.append(res)
 
     df = pd.DataFrame(results)
