@@ -4,7 +4,7 @@ import timeit
 import numpy as np
 import pandas as pd
 from typing import Optional
-from cs336_basics import TransformerLM, config as cfg
+from cs336_basics import TransformerLM, config as cfg, AdamW
 
 # 定义模型配置
 MODEL_CONFIGS = {
@@ -17,7 +17,8 @@ MODEL_CONFIGS = {
 
 MODE = {
     "forward": 0,
-    "backward": 1
+    "backward": 1,
+    "optimize": 2
 }
 
 
@@ -50,29 +51,24 @@ def benchmark_model(
     input_ids = torch.randint(
         0, vocab_size, (batch_size, context_length)).to(device)
 
+    optimizer = AdamW(
+        params=model.parameters(),
+        lr=config["lr"],
+        weight_decay=config["weight_decay"],
+        betas=config["betas"],
+        eps=config["eps"],
+    )
+
     # 预热阶段：必须包含同步以确保状态稳定
     for _ in range(warmup_steps):
-        # ... 执行 forward/backward ...
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
+        run_mode(mode, model, optimizer, input_ids)
 
     # 计时测量：记录每一步的时间以便计算标准差
     step_times = []
     for _ in range(num_steps):
         start_step = timeit.default_timer()
 
-        # 执行逻辑 (注意：作业要求支持仅前向或前后向)
-        if mode == MODE['forward']:
-            with torch.no_grad():
-                _ = model.forward(input_ids)["logits"]
-        else:
-            outputs = model.forward(input_ids)["logits"]
-            loss = outputs.sum()
-            loss.backward()
-            model.zero_grad()
-
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()  # 每一步都要同步
+        run_mode(mode, model, optimizer, input_ids)
 
         end_step = timeit.default_timer()
         step_times.append(end_step - start_step)
@@ -88,6 +84,39 @@ def benchmark_model(
         "Avg Time (s)": avg_time,
         "Std Dev (s)": std_dev
     }
+
+
+def run_mode(mode, model, optimizer, input_ids):
+    if mode == MODE['forward']:
+        with torch.no_grad():
+            forward(model, input_ids)
+    elif mode == MODE['backward']:
+        forward_backward(model, input_ids)
+        model.zero_grad()
+    elif mode == MODE['optimize']:
+        optimize(model, optimizer, input_ids)
+        model.zero_grad()
+
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
+def forward(model, input_ids):
+    _ = model.forward(input_ids)["logits"]
+
+
+def forward_backward(model, input_ids):
+    outputs = model.forward(input_ids)["logits"]
+    loss = outputs.sum()
+    loss.backward()
+
+
+def optimize(model, optimizer, input_ids):
+    optimizer.zero_grad(set_to_none=True)
+    outputs = model.forward(input_ids)["logits"]
+    loss = outputs.sum()
+    loss.backward()
+    optimizer.step()
 
 
 if __name__ == "__main__":
