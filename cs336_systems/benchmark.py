@@ -29,6 +29,7 @@ PRECISION = {
     "fp16": 1,
     "bf16": 2
 }
+RECORD_MEM = False
 
 
 def benchmark_model(
@@ -52,7 +53,8 @@ def benchmark_model(
     # 1. 硬件与精度上下文准备
     device_type = "cuda" if "cuda" in device else "cpu"
 
-    # 核心：使用 nullcontext 作为 fp32 的占位符
+    # 核心
+    # 使用 nullcontext 作为 fp32 的占位符
     if precision == PRECISION['fp32']:
         ctx = nullcontext()
         scaler = None
@@ -101,11 +103,17 @@ def benchmark_model(
 
     # 计时测量：记录每一步的时间以便计算标准差
     step_times = []
+    if RECORD_MEM:
+        torch.cuda.memory._record_memory_history(max_entries=1000000)
+
     for _ in range(num_steps):
         start_step = timeit.default_timer()
         run_mode(mode, model, optimizer, input_ids, ctx, scaler)
         end_step = timeit.default_timer()
         step_times.append(end_step - start_step)
+    if RECORD_MEM:
+        torch.cuda.memory._dump_snapshot("memory_snapshot.pickle")
+        torch.cuda.memory._record_memory_history(enabled=None)
 
     return {
         "Size": size,
