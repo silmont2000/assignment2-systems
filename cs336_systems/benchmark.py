@@ -20,23 +20,23 @@ MODEL_CONFIGS = {
 }
 
 MODE = {
-    "forward": 0,
-    "backward": 1,
-    "optimize": 2
+    "forward": 'forward',
+    "backward": 'backward',
+    "optimize": 'optimize'
 }
 PRECISION = {
-    "fp32": 0,
-    "fp16": 1,
-    "bf16": 2
+    "fp32": 'fp32',
+    "fp16": 'fp16',
+    "bf16": 'bf16'
 }
-RECORD_MEM = False
+RECORD_MEM = True
 
 
 def benchmark_model(
     size: str,
     context_length: int,
-    mode: int,
-    precision: int = PRECISION['fp32'],  # 控制精度模式
+    mode: str,
+    precision: str = PRECISION['fp32'],  # 控制精度模式
     batch_size: int = 4,
     vocab_size: int = 10000,
     warmup_steps: int = 5,
@@ -103,17 +103,21 @@ def benchmark_model(
 
     # 计时测量：记录每一步的时间以便计算标准差
     step_times = []
-    if RECORD_MEM:
-        torch.cuda.memory._record_memory_history(max_entries=1000000)
 
     for _ in range(num_steps):
         start_step = timeit.default_timer()
         run_mode(mode, model, optimizer, input_ids, ctx, scaler)
         end_step = timeit.default_timer()
         step_times.append(end_step - start_step)
+
     if RECORD_MEM:
-        torch.cuda.memory._dump_snapshot("memory_snapshot.pickle")
-        torch.cuda.memory._record_memory_history(enabled=None)
+        # 10万条足以覆盖 Small 模型的一个 Step
+        torch.cuda.memory._record_memory_history(max_entries=1000000)
+        
+        run_mode(mode, model, optimizer, input_ids, ctx, scaler)
+        
+        torch.cuda.memory._dump_snapshot(f"memory_{mode}_{precision}_{context_length}.pickle")
+        torch.cuda.memory._record_memory_history(enabled=None) # 彻底关闭
 
     return {
         "Size": size,
@@ -180,12 +184,12 @@ def optimize(model, optimizer, input_ids):
 if __name__ == "__main__":
     # 示例运行
     results = []
-    for size in ["Medium"]:
+    for size in ["Small"]:
         results = []
-        for ctx_len in [128, 256, 512]:
+        for ctx_len in [128]:
             # 增加 mode 参数的传递，否则默认是 "forward_backward" 会走 else 分支
             res = benchmark_model(
-                size, ctx_len, mode=MODE['forward'], warmup_steps=5, precision=PRECISION['bf16'])
+                size, ctx_len, mode=MODE['forward'], warmup_steps=5, num_steps=1, precision=PRECISION['fp32'])
             # res = benchmark_model(
             #     size, ctx_len, mode=MODE['backward'], warmup_steps=5)
             # res = benchmark_model(

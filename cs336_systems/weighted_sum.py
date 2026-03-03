@@ -30,7 +30,7 @@ def weighted_sum_fwd(
     # x_block_ptr: 指向 x 张量中当前线程块需要处理的区域
     x_block_ptr = tl.make_block_ptr(
         base=x_ptr,
-        shape=(ROWS, D),                  # 张量的整体形状
+        shape=(ROWS, D),                  # 张量的【整体】形状
         strides=(x_stride_row, x_stride_dim),  # 内存布局的步幅
         # 起始偏移：行方向偏移为 块ID * 块大小，列方向从0开始
         offsets=(row_tile_idx * ROWS_TILE_SIZE, 0),
@@ -144,6 +144,7 @@ class WeightedSumFunc(torch.autograd.Function):
         def grid(META): return (triton.cdiv(N, META['ROWS_TILE_SIZE']),)
 
         # 调用 Triton 核函数
+        # 我们会定义一个所谓的“启动网格”的线程块。然后，我们可以在内核中通过 tl.program_id(0) 访问线程块索引。
         weighted_sum_fwd[grid](
             x_2d, weight,                # 输入输出张量
             y,
@@ -179,3 +180,8 @@ class WeightedSumFunc(torch.autograd.Function):
         grad_x = None
         grad_weight = None
         return grad_x, grad_weight
+
+
+def weighted_sum(x, weight):
+    # Here, assume that x has n-dim shape [..., D], and weight has 1D shape [D]
+    return (weight * x).sum(axis=-1)
