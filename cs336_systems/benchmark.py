@@ -29,7 +29,7 @@ PRECISION = {
     "fp16": 'fp16',
     "bf16": 'bf16'
 }
-RECORD_MEM = True
+RECORD_MEM = False
 
 
 def benchmark_model(
@@ -126,6 +126,7 @@ def benchmark_model(
         "Context": context_length,
         "Avg Time (s)": np.mean(step_times),
         "Std Dev (s)": np.std(step_times),
+        "Warmup":warmup_steps
     }
 
 
@@ -184,12 +185,12 @@ def optimize(model, optimizer, input_ids):
 if __name__ == "__main__":
     # 示例运行
     results = []
-    for size in ["Small"]:
+    for size in ["2.7B"]:
         results = []
         for ctx_len in [128]:
             # 增加 mode 参数的传递，否则默认是 "forward_backward" 会走 else 分支
             res = benchmark_model(
-                size, ctx_len, mode=MODE['forward'], warmup_steps=5, num_steps=1, precision=PRECISION['fp32'])
+                size, ctx_len, mode=MODE['forward'], warmup_steps=1, num_steps=10, precision=PRECISION['bf16'])
             # res = benchmark_model(
             #     size, ctx_len, mode=MODE['backward'], warmup_steps=5)
             # res = benchmark_model(
