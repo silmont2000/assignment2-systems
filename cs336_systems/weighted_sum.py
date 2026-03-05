@@ -35,7 +35,7 @@ def weighted_sum_fwd(
         # 起始偏移：行方向偏移为 块ID * 块大小，列方向从0开始
         offsets=(row_tile_idx * ROWS_TILE_SIZE, 0),
         block_shape=(ROWS_TILE_SIZE, D_TILE_SIZE),  # 每次加载的块大小
-        order=(1, 0)                      # 内存访问顺序：先列后行（适配GPU内存合并）
+        order=(1, 0)                      # 内存访问顺序 行优先、行连续
     )
 
     # weight_block_ptr: 指向 weight 张量
@@ -43,7 +43,7 @@ def weighted_sum_fwd(
         base=weight_ptr,
         shape=(D,),
         strides=(weight_stride_dim,),
-        offsets=(0,),
+        offsets=(0,),  # 由于每一个并行的线程块（无论它在算第几行）都需要从 weight 的 第 0 个元素 开始读取
         block_shape=(D_TILE_SIZE,),
         order=(0,)
     )
@@ -70,7 +70,7 @@ def weighted_sum_fwd(
         # padding_option="zero": 越界部分填充0
         row = tl.load(
             x_block_ptr,
-            boundary_check=(0, 1),  # 检查行和列两个维度
+            boundary_check=(0, 1),  # 检查0和1两个维度
             padding_option="zero"
         )  # 加载形状: [ROWS_TILE_SIZE, D_TILE_SIZE]
 
@@ -98,17 +98,22 @@ def weighted_sum_fwd(
     )
 
 
-
 @triton.jit
 def weighted_sum_backward(
     x_ptr, weight_ptr,  # 输入：前向计算的张量 x 和权重 weight
     grad_output_ptr,     # 输入：上游梯度（grad_output）
-    grad_x_ptr, partial_grad_weight_ptr,  # 输出：对 x 的梯度 grad_x，对 weight 的部分梯度 partial_grad_weight
+    # 输出：对 x 的梯度 grad_x，对 weight 的部分梯度 partial_grad_weight
+    # 对于某一个元素x(i,j)，它只参与了第 i 行的求和, 所以每个线程块写的grad_x互不重叠
+    grad_x_ptr,
+    # partial_grad_weight_ptr是对weight求导的结果。权重W(i,j) 参与所有行的计算，不同线程块都想往grad_W里写东西
+    # 为了避免冲突，用partial_grad_weight_ptr来保存各个线程自己的梯度
+    partial_grad_weight_ptr,
+
     stride_xr, stride_xd,  # 张量 x 的行和列维度步长
     stride_wd,             # 张量 weight 的维度步长
     stride_gr,             # 张量 grad_output 的维度步长
-    stride_gxr, stride_gxd, # 张量 grad_x 的行和列维度步长
-    stride_gwb, stride_gwd, # 张量 partial_grad_weight 的行和列维度步长
+    stride_gxr, stride_gxd,  # 张量 grad_x 的行和列维度步长
+    stride_gwb, stride_gwd,  # 张量 partial_grad_weight 的行和列维度步长
     NUM_ROWS, D,  # 输入维度：行数 NUM_ROWS，特征维度 D
     ROWS_TILE_SIZE: tl.constexpr,  # 编译时常量：行 tile 大小
     D_TILE_SIZE: tl.constexpr      # 编译时常量：特征 tile 大小
@@ -118,7 +123,7 @@ def weighted_sum_backward(
     n_row_tiles = tl.num_programs(0)
 
     # 1. 创建 grad_output 的块指针
-    # 形状：(NUM_ROWS,)，步长：stride_gr
+    # 形状：(NUM_ROWS,)，步长：stride_gr 形状和前向输出是一样的，所以是block_shape=(ROWS_TILE_SIZE,),
     # 偏移：从当前行 tile 的起始位置开始
     # 块形状：(ROWS_TILE_SIZE,)，顺序：按行加载
     grad_output_block_ptr = tl.make_block_ptr(
@@ -179,28 +184,35 @@ def weighted_sum_backward(
     # 按 D 维度 tile 循环，处理所有特征维度
     for i in range(tl.cdiv(D, D_TILE_SIZE)):
         # 加载当前 grad_output tile：形状 (ROWS_TILE_SIZE,)
-        grad_output = tl.load(grad_output_block_ptr, boundary_check=(0,), padding_option="zero")
+        grad_output = tl.load(grad_output_block_ptr,
+                              boundary_check=(0,), padding_option="zero")
+        # 加载当前 weight tile：形状 (D_TILE_SIZE,)
+        weight = tl.load(weight_block_ptr, boundary_check=(
+            0,), padding_option="zero")
+        # 加载当前 x tile：形状 (ROWS_TILE_SIZE, D_TILE_SIZE)
+        row = tl.load(x_block_ptr, boundary_check=(
+            0, 1), padding_option="zero")
 
         # 计算 grad_x：外积 grad_x = grad_output[:, None] * weight[None, :]
-        # 加载当前 weight tile：形状 (D_TILE_SIZE,)
-        weight = tl.load(weight_block_ptr, boundary_check=(0,), padding_option="zero")
         # 计算外积：形状 (ROWS_TILE_SIZE, D_TILE_SIZE)
         grad_x_row = grad_output[:, None] * weight[None, :]
         # 存储到 grad_x 的对应位置
         tl.store(grad_x_block_ptr, grad_x_row, boundary_check=(0, 1))
 
         # 计算 partial_grad_weight：对 x * grad_output 按行求和
-        # 加载当前 x tile：形状 (ROWS_TILE_SIZE, D_TILE_SIZE)
-        row = tl.load(x_block_ptr, boundary_check=(0, 1), padding_option="zero")
         # 逐元素相乘后，按行（axis=0）求和，得到形状 (1, D_TILE_SIZE)
-        grad_weight_row = tl.sum(row * grad_output[:, None], axis=0, keep_dims=True)
+        grad_weight_row = tl.sum(
+            row * grad_output[:, None], axis=0, keep_dims=True)
+        # axis=0 沿着行压缩，意思是把行12345压缩（加和）
         # 存储到 partial_grad_weight 的对应位置
-        tl.store(partial_grad_weight_block_ptr, grad_weight_row, boundary_check=(1,))
+        tl.store(partial_grad_weight_block_ptr,
+                 grad_weight_row, boundary_check=(1,))
 
         # 移动所有指针到下一个 D 维度 tile
         x_block_ptr = x_block_ptr.advance((0, D_TILE_SIZE))
         weight_block_ptr = weight_block_ptr.advance((D_TILE_SIZE,))
-        partial_grad_weight_block_ptr = partial_grad_weight_block_ptr.advance((0, D_TILE_SIZE))
+        partial_grad_weight_block_ptr = partial_grad_weight_block_ptr.advance(
+            (0, D_TILE_SIZE))
         grad_x_block_ptr = grad_x_block_ptr.advance((0, D_TILE_SIZE))
 
 
@@ -272,12 +284,14 @@ class WeightedSumFunc(torch.autograd.Function):
     def backward(ctx, grad_out):
         # 从上下文中恢复前向保存的张量和 tile 大小
         x, weight = ctx.saved_tensors
-        ROWS_TILE_SIZE, D_TILE_SIZE = ctx.ROWS_TILE_SIZE, ctx.D_TILE_SIZE  # 行 tile 和特征 tile 大小可不同
+        # 行 tile 和特征 tile 大小可不同
+        ROWS_TILE_SIZE, D_TILE_SIZE = ctx.ROWS_TILE_SIZE, ctx.D_TILE_SIZE
         n_rows, D = x.shape  # 获取输入张量 x 的形状
 
         # 策略：每个线程块先写入部分梯度缓冲区，再对缓冲区进行归约得到最终梯度
         # 初始化部分梯度缓冲区 partial_grad_weight：形状 (n_row_tiles, D)
-        partial_grad_weight = torch.empty((triton.cdiv(n_rows, ROWS_TILE_SIZE), D), device=x.device, dtype=x.dtype)
+        partial_grad_weight = torch.empty(
+            (triton.cdiv(n_rows, ROWS_TILE_SIZE), D), device=x.device, dtype=x.dtype)
         # 初始化 grad_x：与 x 形状相同
         grad_x = torch.empty_like(x)
 
@@ -308,9 +322,9 @@ f_weightedsum = WeightedSumFunc.apply
 def weighted_sum(x, weight):
     # Here, assume that x has n-dim shape [..., D], and weight has 1D shape [D]
     # return (weight * x).sum(axis=-1)
-    return f_weightedsum(x,weight)
+    return f_weightedsum(x, weight)
 
-    
+
 if __name__ == "__main__":
     batch_size = 8
     seq_len = 1024
@@ -318,8 +332,9 @@ if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # 1. 准备数据
-    x = torch.randn(batch_size, seq_len, d_model, device=device, requires_grad=True)
-    
+    x = torch.randn(batch_size, seq_len, d_model,
+                    device=device, requires_grad=True)
+
     # 【核心修改点】：你的 Kernel 逻辑是 y = sum(x * weight, dim=-1)
     # 这里的 weight 必须是 1D 向量 [16]，才能匹配你在 Forward 里的 weight_block_ptr 逻辑
     W = torch.randn(d_model, device=device, requires_grad=True) * 0.01
@@ -328,6 +343,6 @@ if __name__ == "__main__":
     # 现在 x 是 [8, 1024, 16], W 是 [16]
     # 输出 res 应该是 [8, 1024]
     res = weighted_sum(x, W)
-    
+
     print(res)
-    print(f"输出形状: {res.shape}") # 预期: torch.Size([8, 1024])
+    print(f"输出形状: {res.shape}")  # 预期: torch.Size([8, 1024])
