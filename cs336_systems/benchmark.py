@@ -10,6 +10,9 @@ import pandas as pd
 from typing import Optional
 from cs336_basics import TransformerLM, config as cfg, AdamW
 
+
+COMPILE = False
+
 # 定义模型配置
 MODEL_CONFIGS = {
     "Small": {"d_model": 768, "d_ff": 3072, "num_layers": 12, "num_heads": 12},
@@ -84,6 +87,9 @@ def benchmark_model(
         context_length,
         device,
     ).to(device)
+    if COMPILE:
+        model = torch.compile(model)
+    
 
     # 生成随机输入数据
     input_ids = torch.randint(
