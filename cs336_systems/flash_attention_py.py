@@ -52,15 +52,6 @@ class PythonFlashAttentionFunction(torch.autograd.Function):
                 # 注意最后两维的转置, 只转置最后两维!! 所以不用一开始上来就K.T
                 score = torch.matmul(qi, kj.transpose(-1, -2)) * sm_scale
 
-                if is_causal:
-                    # 获取当前 block 的行索引和列索引
-                    row_indices = torch.arange(
-                        i * Br, min((i + 1) * Br, Seq), device=Q.device).view(-1, 1)
-                    col_indices = torch.arange(
-                        j * Bc, min((j + 1) * Bc, Seq), device=K.device).view(1, -1)
-                    mask = row_indices < col_indices
-                    score = score.masked_fill(mask, float("-inf"))
-
                 # --- online Softmax ---
                 # 计算当前块的最大值
                 m_ij = torch.max(score, dim=-1, keepdim=True).values
@@ -122,71 +113,11 @@ class PythonFlashAttentionFunction(torch.autograd.Function):
         dK = torch.zeros_like(K)
         dV = torch.zeros_like(V)
 
-        # 准备 D (rowsum(dO * O))
-        D = torch.sum(dO * O, dim=-1)
-
-        Br = 16
-        Bc = 16
-        Batch, Seq, Dim = Q.shape
-        sm_scale = Dim ** -0.5
-
-        rows = (Seq + Br - 1) // Br
-        columns = (Seq + Bc - 1) // Bc
-
-        for j in range(columns):
-            j_start, j_end = j * Bc, min((j + 1) * Bc, Seq)
-            kj = K[:, j_start:j_end, :]
-            vj = V[:, j_start:j_end, :]
-            dkj = torch.zeros_like(kj)
-            dvj = torch.zeros_like(vj)
-
-            for i in range(rows):
-                i_start, i_end = i * Br, min((i + 1) * Br, Seq)
-                qi = Q[:, i_start:i_end, :]
-                oi = O[:, i_start:i_end, :]
-                doi = dO[:, i_start:i_end, :]
-                Li = L[:, i_start:i_end].unsqueeze(-1)
-                Di = D[:, i_start:i_end].unsqueeze(-1)
-
-                # 重构 S_ij
-                score = torch.matmul(qi, kj.transpose(-1, -2)) * sm_scale
-                if is_causal:
-                    row_indices = torch.arange(
-                        i_start, i_end, device=Q.device).view(-1, 1)
-                    col_indices = torch.arange(
-                        j_start, j_end, device=K.device).view(1, -1)
-                    mask = row_indices < col_indices
-                    score = score.masked_fill(mask, float("-inf"))
-
-                # P_ij = exp(S_ij - L_i)
-                p_ij = torch.exp(score - Li)
-
-                # dV_j += P_ij^T @ dO_i
-                dvj += torch.matmul(p_ij.transpose(-1, -2), doi)
-
-                # dP_ij = dO_i @ V_j^T
-                dp_ij = torch.matmul(doi, vj.transpose(-1, -2))
-
-                # dS_ij = P_ij * (dP_ij - D_i)
-                ds_ij = p_ij * (dp_ij - Di)
-
-                # dQ_i += dS_ij @ K_j * sm_scale
-                dQ[:, i_start:i_end, :] += torch.matmul(ds_ij, kj) * sm_scale
-
-                # dK_j += dS_ij^T @ Q_i * sm_scale
-                dkj += torch.matmul(ds_ij.transpose(-1, -2), qi) * sm_scale
-
-            dK[:, j_start:j_end, :] = dkj
-            dV[:, j_start:j_end, :] = dvj
-
         # 对应 forward 的输入: Q, K, V, is_causal
         return dQ, dK, dV, None
 
-# 为了方便调用，封装一个简单的接口
-
 
 def flash_attention_pytorch(Q, K, V, is_causal=False):
-    # .apply 会触发 PythonFlashAttentionFunction 的 forward
-    # 它返回 (O, L)，我们只把 O 交给测试框架，L 已经通过 ctx 存好了
+    # 修改：适配只返回一个 O 的 forward
     O = PythonFlashAttentionFunction.apply(Q, K, V, is_causal)
     return O
