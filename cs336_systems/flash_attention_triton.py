@@ -47,6 +47,7 @@ def flash_fwd_kernel(
     D: tl.constexpr,            # 每个 Token 的特征维度 (Head Dim)
     Q_TILE_SIZE: tl.constexpr,  # Query 的分块大小 (Bq) 理解成横着多少行分一批
     K_TILE_SIZE: tl.constexpr,  # Key/Value 的分块大小 (Bk)
+    is_causal: tl.constexpr,  # 是否自回归mask
 ):
     # 1. 获取程序索引
     query_tile_index = tl.program_id(0)
@@ -92,6 +93,19 @@ def flash_fwd_kernel(
 
     # 5. 核心循环：迭代 Key/Value 瓦片
     for j in range(0, tl.cdiv(N_KEYS, K_TILE_SIZE)):
+        if is_causal:
+            # 计算当前元素在全局矩阵中的位置
+            cur_q_idx = query_tile_index * Q_TILE_SIZE + tl.arange(0, Q_TILE_SIZE)
+            cur_k_idx = j * K_TILE_SIZE + tl.arange(0, K_TILE_SIZE)
+            # 掩码条件：行索引 < 列索引 的地方是“未来”
+            mask = cur_q_idx[:, None] >= cur_k_idx[None, :]
+            # if tl.max(cur_q_idx)<tl.min(cur_k_idx):
+            #     break
+            # if tl.min(cur_q_idx)>tl.max(cur_k_idx):
+            #     is_causal = False
+
+        
+
         # 加载 Kj, Vj (使用 boundary_check 应对非 TILE 整数倍的情况)
         Kj = tl.load(K_block_ptr, boundary_check=(0,1), padding_option="zero")  
         Vj = tl.load(V_block_ptr, boundary_check=(0,1), padding_option="zero")  
@@ -99,6 +113,9 @@ def flash_fwd_kernel(
         # 计算得分 S = (Q @ K.T) * scale
         # Qi 是 [Q_TILE, D], Kj 已经是 [D, K_TILE]，所以直接乘
         score = tl.dot(Qi, Kj) * scale
+        # 将未来的得分设为负无穷
+        if is_causal:
+            score = tl.where(mask, score, float("-inf"))
 
         # 更新 m (最大值)
         # m_ij 是当前 block 的行最大值 [Q_TILE_SIZE, 1]
@@ -188,7 +205,8 @@ class TritonFlashAttentionFunction(torch.autograd.Function):
             n_queries, n_keys,
             scale,
             D=d, Q_TILE_SIZE=Q_TILE_SIZE, K_TILE_SIZE=K_TILE_SIZE,
-            num_warps=4, num_stages=2
+            num_warps=4, num_stages=2,
+            is_causal = is_causal
         )
 
         ctx.save_for_backward(q, k, v, o, lse)
